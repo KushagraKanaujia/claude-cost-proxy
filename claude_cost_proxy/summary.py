@@ -1,13 +1,15 @@
-"""Summary command to display usage statistics from Throttle logs."""
+"""Summary command to display usage statistics from the proxy logs."""
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from . import config
 
 
 def get_log_dir() -> Path:
-    """Get the Throttle logs directory."""
-    return Path.home() / ".throttle" / "logs"
+    """Get the proxy logs directory (honours CLAUDE_PROXY_HOME)."""
+    return config.log_dir()
 
 
 def parse_log_file(log_file: Path) -> List[Dict]:
@@ -67,9 +69,9 @@ def calculate_stats(entries: List[Dict]) -> Dict:
     }
 
 
-def get_date_range_stats(days: int) -> Tuple[Dict, List[Tuple[str, Dict]]]:
+def get_date_range_stats(days: int, log_dir: Optional[Path] = None) -> Tuple[Dict, List[Tuple[str, Dict]]]:
     """Get statistics for the last N days."""
-    log_dir = get_log_dir()
+    log_dir = log_dir or get_log_dir()
     today = datetime.now().date()
     
     all_entries = []
@@ -108,16 +110,16 @@ def format_number(num: int) -> str:
     return f"{num:,}"
 
 
-def print_summary() -> None:
+def print_summary(log_dir: Optional[Path] = None) -> None:
     """Print usage summary for today and last 7 days."""
-    print("📊 Throttle Usage Summary")
+    print("📊 Claude Cost Proxy Usage Summary")
     print("=" * 70)
     print()
     
     # Today's stats
     print("Today")
     print("-" * 70)
-    today_stats, _ = get_date_range_stats(1)
+    today_stats, _ = get_date_range_stats(1, log_dir)
     
     if today_stats["total_requests"] == 0:
         print("No requests logged today.")
@@ -145,7 +147,7 @@ def print_summary() -> None:
     # Last 7 days
     print("Last 7 Days")
     print("-" * 70)
-    week_stats, daily_breakdown = get_date_range_stats(7)
+    week_stats, daily_breakdown = get_date_range_stats(7, log_dir)
     
     if week_stats["total_requests"] == 0:
         print("No requests logged in the last 7 days.")
@@ -187,9 +189,9 @@ def main() -> None:
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        print("Usage: throttle-summary")
+        print("Usage: claude-proxy-summary")
         print()
-        print("Display Throttle usage statistics for today and the last 7 days.")
+        print("Display usage statistics for today and the last 7 days.")
         sys.exit(0)
     
     try:

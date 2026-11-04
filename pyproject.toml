@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-cost-proxy"
-version = "0.1.0"
-description = "HTTP proxy for Claude Code with cost tracking, request logging, and semantic caching"
+version = "0.2.0"
+description = "Local HTTP proxy for Claude Code with cost tracking, request logging, and response caching"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -15,10 +15,17 @@ dependencies = [
     "aiohttp>=3.9,<4"
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 claude-proxy = "claude_cost_proxy.server:main"
 claude-proxy-setup = "claude_cost_proxy.setup:main"
 claude-proxy-summary = "claude_cost_proxy.summary:main"
+claude-proxy-demo = "claude_cost_proxy.demo:main"
 
 [tool.setuptools]
 packages = ["claude_cost_proxy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

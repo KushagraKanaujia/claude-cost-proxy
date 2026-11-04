@@ -1,0 +1,49 @@
+🧪 claude-cost-proxy demo (mock upstream, no API key, no network)
+
+Sending 6 requests through the proxy:
+
+  [MISS] json    Ask a question
+  [HIT ] json    Ask the same question again
+  [MISS] stream  Streamed question (how Claude Code calls)
+  [HIT ] stream  Same streamed question again
+  [MISS] stream  Request that triggers a file edit (tool use)
+  [MISS] stream  Same edit request again
+
+Upstream received 4 of 6 requests; the rest were served from the proxy cache.
+Token counts come from the mock and are illustrative.
+
+📊 Claude Cost Proxy Usage Summary
+======================================================================
+
+Today
+----------------------------------------------------------------------
+  Requests:        6
+  Cache hits:      2 (33.3%)
+  Cache misses:    4
+
+  Input tokens:    8,532
+  Output tokens:   3,840
+  Cache reads:     54,000
+  Cache writes:    0
+
+  💰 Cost:         $0.066
+  💚 Saved:        $0.033
+  📈 Savings:      33.4%
+
+
+Last 7 Days
+----------------------------------------------------------------------
+  Requests:        6
+  Cache hits:      2 (33.3%)
+  Cache misses:    4
+
+  Input tokens:    8,532
+  Output tokens:   3,840
+  Cache reads:     54,000
+  Cache writes:    0
+
+  💰 Cost:         $0.066
+  💚 Saved:        $0.033
+  📈 Savings:      33.4%
+
+Next: run `claude-proxy-setup` with your own key to use it with Claude Code.
