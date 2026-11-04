@@ -1,15 +1,65 @@
-"""HTTP proxy server that forwards requests to Anthropic API with logging and caching."""
-import asyncio
+"""HTTP proxy that forwards Claude Code's API calls to Anthropic with logging and caching.
+
+Handles both plain JSON responses and server-sent-event (``"stream": true``)
+responses, which is what Claude Code sends by default.
+"""
 import hashlib
 import json
 import os
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import httpx
 from aiohttp import web
+
+from . import config
+from .pricing import cost_usd
+
+CACHE_TTL_SECONDS = 24 * 60 * 60
+FORWARDED_HEADERS = ("anthropic-version", "anthropic-beta")
+_PATH_PATTERN = re.compile(r'(?:^|[\s\'"(])((?:[./~])?[\w\-./]+\.\w+)(?:$|[\s\'"):,])')
+
+
+def parse_sse_usage(raw: bytes) -> Tuple[Dict[str, int], bool]:
+    """Pull token usage and tool-use presence out of an Anthropic SSE stream.
+
+    ``message_start`` carries the input-side usage; ``message_delta`` events
+    carry the (cumulative) output-side usage.
+    """
+    usage: Dict[str, int] = {}
+    has_tool_use = False
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        if etype == "message_start":
+            for k, v in (event.get("message", {}).get("usage") or {}).items():
+                if isinstance(v, int):
+                    usage[k] = v
+        elif etype == "message_delta":
+            for k, v in (event.get("usage") or {}).items():
+                if isinstance(v, int):
+                    usage[k] = v
+        elif etype == "content_block_start":
+            if (event.get("content_block") or {}).get("type") == "tool_use":
+                has_tool_use = True
+    return usage, has_tool_use
+
+
+def _usage_fields(usage: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        "input_tokens": usage.get("input_tokens", 0) or 0,
+        "output_tokens": usage.get("output_tokens", 0) or 0,
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+    }
 
 
 class ThrottleProxy:
@@ -19,324 +69,285 @@ class ThrottleProxy:
         log_dir: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
         api_key: Optional[str] = None,
+        upstream: Optional[str] = None,
+        host: str = "127.0.0.1",
     ):
         self.port = port
-        self.log_dir = log_dir or Path.home() / ".throttle" / "logs"
-        self.cache_dir = cache_dir or Path.home() / ".throttle" / "cache"
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        
-        # Ensure directories exist
+        self.host = host
+        self.log_dir = log_dir or config.log_dir()
+        self.cache_dir = cache_dir or config.cache_dir()
+        self.api_key = api_key or config.load_api_key()
+        self.upstream = (upstream or config.upstream_url()).rstrip("/")
+
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Anthropic pricing per million tokens (as of current rates)
-        self.pricing = {
-            "claude-3-5-sonnet-20241022": {
-                "input": 3.00,
-                "output": 15.00,
-                "cache_write": 3.75,
-                "cache_read": 0.30,
-            },
-            "claude-3-5-sonnet-20240620": {
-                "input": 3.00,
-                "output": 15.00,
-                "cache_write": 3.75,
-                "cache_read": 0.30,
-            },
-            "claude-3-opus-20240229": {
-                "input": 15.00,
-                "output": 75.00,
-                "cache_write": 18.75,
-                "cache_read": 1.50,
-            },
-            "claude-3-sonnet-20240229": {
-                "input": 3.00,
-                "output": 15.00,
-                "cache_write": 3.75,
-                "cache_read": 0.30,
-            },
-            "claude-3-haiku-20240307": {
-                "input": 0.25,
-                "output": 1.25,
-                "cache_write": 0.30,
-                "cache_read": 0.03,
-            },
-        }
 
+    # ---- logging -------------------------------------------------------
     def _get_log_file(self) -> Path:
-        """Get today's log file path."""
         today = datetime.now().strftime("%Y-%m-%d")
         return self.log_dir / f"throttle-{today}.jsonl"
 
     def _log_request(self, log_entry: Dict[str, Any]) -> None:
-        """Append a log entry to today's log file."""
-        log_file = self._get_log_file()
-        with open(log_file, "a") as f:
+        with open(self._get_log_file(), "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
-    def _calculate_cost(self, model: str, usage: Dict[str, int]) -> float:
-        """Calculate cost in dollars for a request."""
-        if model not in self.pricing:
-            # Default to Sonnet pricing if model not recognized
-            model = "claude-3-5-sonnet-20241022"
-        
-        prices = self.pricing[model]
-        cost = 0.0
-        cost += (usage.get("input_tokens", 0) / 1_000_000) * prices["input"]
-        cost += (usage.get("output_tokens", 0) / 1_000_000) * prices["output"]
-        cost += (usage.get("cache_creation_input_tokens", 0) / 1_000_000) * prices["cache_write"]
-        cost += (usage.get("cache_read_input_tokens", 0) / 1_000_000) * prices["cache_read"]
-        return cost
+    def _log(self, model: str, cache_hit: bool, start: float, usage: Dict[str, Any],
+             stream: bool) -> None:
+        usage = _usage_fields(usage)
+        cost = cost_usd(model, usage)
+        self._log_request({
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "cache_hit": cache_hit,
+            "stream": stream,
+            "latency_ms": (time.time() - start) * 1000,
+            "usage": usage,
+            "cost_usd": 0.0 if cache_hit else cost,
+            "saved_usd": cost if cache_hit else 0.0,
+        })
 
+    # Kept for backwards compatibility with earlier versions.
+    def _calculate_cost(self, model: str, usage: Dict[str, int]) -> float:
+        return cost_usd(model, usage)
+
+    # ---- caching -------------------------------------------------------
     def _hash_request(self, request_body: Dict[str, Any]) -> str:
-        """Create a hash of the request body for cache lookups."""
-        # Create a stable JSON representation for hashing
         canonical = json.dumps(request_body, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def _has_tool_use(self, response_body: Dict[str, Any]) -> bool:
-        """Check if response contains any tool use blocks."""
         content = response_body.get("content", [])
         if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    return True
+            return any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
         return False
 
-    def _extract_file_paths(self, request_body: Dict[str, Any]) -> list[str]:
-        """Extract file paths mentioned in the request for cache invalidation."""
+    def _extract_file_paths(self, request_body: Dict[str, Any]) -> list:
+        """Heuristic: file-like paths mentioned in message text, for cache invalidation."""
         paths = []
-        messages = request_body.get("messages", [])
-        
-        for message in messages:
+        for message in request_body.get("messages", []):
             content = message.get("content", "")
+            texts: Iterable[str]
             if isinstance(content, str):
-                # Simple heuristic: look for common file path patterns
-                # This is basic but works for the MVP
-                import re
-                # Match absolute paths and relative paths with extensions
-                path_pattern = r'(?:^|[\s\'"(])((?:[./~])?[\w\-./]+\.\w+)(?:$|[\s\'"):,])'
-                found_paths = re.findall(path_pattern, content)
-                paths.extend(found_paths)
-        
+                texts = [content]
+            elif isinstance(content, list):
+                texts = [b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text"]
+            else:
+                texts = []
+            for text in texts:
+                paths.extend(_PATH_PATTERN.findall(text))
         return paths
 
-    def _check_files_unchanged(self, paths: list[str], cached_time: float) -> bool:
-        """Check if all referenced files haven't been modified since cache time."""
+    def _check_files_unchanged(self, paths: list, cached_time: float) -> bool:
         for path_str in paths:
             try:
-                # Expand user and resolve relative paths
                 path = Path(path_str).expanduser()
                 if not path.is_absolute():
-                    # Try relative to current working directory
                     path = (Path.cwd() / path).resolve()
-                
-                if path.exists() and path.is_file():
-                    mtime = path.stat().st_mtime
-                    if mtime > cached_time:
-                        return False
+                if path.exists() and path.is_file() and path.stat().st_mtime > cached_time:
+                    return False
             except (OSError, ValueError):
-                # If we can't check the file, assume it changed
                 return False
-        
         return True
 
-    def _get_cached_response(
-        self, request_hash: str, request_body: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Try to retrieve a cached response if valid."""
+    def _get_cached_response(self, request_hash: str,
+                             request_body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         cache_file = self.cache_dir / f"{request_hash}.json"
-        
         if not cache_file.exists():
             return None
-        
         try:
             with open(cache_file, "r") as f:
-                cache_entry = json.load(f)
-            
-            cached_time = cache_entry["timestamp"]
-            now = time.time()
-            
-            # Check if cache is within 1 day
-            if now - cached_time > 86400:  # 24 hours
+                entry = json.load(f)
+            cached_time = entry["timestamp"]
+            if time.time() - cached_time > CACHE_TTL_SECONDS:
                 return None
-            
-            # Extract file paths and check if they've changed
-            file_paths = self._extract_file_paths(request_body)
-            if file_paths and not self._check_files_unchanged(file_paths, cached_time):
+            paths = self._extract_file_paths(request_body)
+            if paths and not self._check_files_unchanged(paths, cached_time):
                 return None
-            
-            return cache_entry
-            
+            return entry
         except (json.JSONDecodeError, KeyError, OSError):
             return None
 
-    def _save_to_cache(
-        self, request_hash: str, request_body: Dict[str, Any], response_body: Dict[str, Any]
-    ) -> None:
-        """Save a response to cache."""
-        cache_file = self.cache_dir / f"{request_hash}.json"
-        cache_entry = {
-            "timestamp": time.time(),
-            "request": request_body,
-            "response": response_body,
-        }
-        
-        with open(cache_file, "w") as f:
-            json.dump(cache_entry, f)
+    def _save_to_cache(self, request_hash: str, request_body: Dict[str, Any],
+                       response_body: Optional[Dict[str, Any]] = None,
+                       sse: Optional[str] = None, usage: Optional[Dict] = None) -> None:
+        entry: Dict[str, Any] = {"timestamp": time.time(), "request": request_body}
+        if sse is not None:
+            entry["sse"] = sse
+            entry["usage"] = usage or {}
+        else:
+            entry["response"] = response_body
+        with open(self.cache_dir / f"{request_hash}.json", "w") as f:
+            json.dump(entry, f)
 
-    async def handle_request(self, request: web.Request) -> web.Response:
-        """Handle incoming proxy requests."""
-        start_time = time.time()
-        
-        # Read the request body
+    # ---- forwarding ----------------------------------------------------
+    def _upstream_headers(self, request: web.Request) -> Dict[str, str]:
+        headers = {"content-type": "application/json"}
+        for name in FORWARDED_HEADERS:
+            if name in request.headers:
+                headers[name] = request.headers[name]
+        headers.setdefault("anthropic-version", "2023-06-01")
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+        elif "x-api-key" in request.headers:
+            headers["x-api-key"] = request.headers["x-api-key"]
+        elif "authorization" in request.headers:
+            headers["authorization"] = request.headers["authorization"]
+        return headers
+
+    def _upstream_url(self, request: web.Request) -> str:
+        return f"{self.upstream}{request.rel_url}"
+
+    async def handle_request(self, request: web.Request) -> web.StreamResponse:
+        start = time.time()
         try:
             request_body = await request.json()
         except json.JSONDecodeError:
             return web.Response(status=400, text="Invalid JSON")
-        
-        # Extract model from request
+
         model = request_body.get("model", "unknown")
+        stream = bool(request_body.get("stream"))
         request_hash = self._hash_request(request_body)
-        
-        # Check cache first
-        cache_hit = False
-        cached_entry = self._get_cached_response(request_hash, request_body)
-        
-        if cached_entry:
-            response_body = cached_entry["response"]
-            cache_hit = True
-            latency_ms = (time.time() - start_time) * 1000
-            
-            # Calculate savings
-            usage = response_body.get("usage", {})
-            saved_cost = self._calculate_cost(model, usage)
-            
-            # Log the cache hit
-            log_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "model": model,
-                "cache_hit": True,
-                "latency_ms": latency_ms,
-                "usage": usage,
-                "cost_usd": 0.0,
-                "saved_usd": saved_cost,
-            }
-            self._log_request(log_entry)
-            
-            return web.json_response(response_body)
-        
-        # Forward to Anthropic API
-        headers = {
-            "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
-            "x-api-key": self.api_key,
-            "content-type": "application/json",
-        }
-        
-        # Copy other headers if present
-        for header in ["anthropic-beta"]:
-            if header in request.headers:
-                headers[header] = request.headers[header]
-        
+
+        cached = self._get_cached_response(request_hash, request_body)
+        if cached is not None:
+            if "sse" in cached:
+                self._log(model, True, start, cached.get("usage", {}), stream=True)
+                resp = web.StreamResponse(headers={"content-type": "text/event-stream",
+                                                   "x-claude-proxy-cache": "hit"})
+                await resp.prepare(request)
+                await resp.write(cached["sse"].encode())
+                await resp.write_eof()
+                return resp
+            if "response" in cached:
+                body = cached["response"]
+                self._log(model, True, start, body.get("usage", {}), stream=False)
+                return web.json_response(body, headers={"x-claude-proxy-cache": "hit"})
+
+        headers = self._upstream_headers(request)
+        url = self._upstream_url(request)
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"https://api.anthropic.com{request.path}",
-                    json=request_body,
-                    headers=headers,
-                    timeout=300.0,  # 5 minute timeout
-                )
-                
-                latency_ms = (time.time() - start_time) * 1000
-                response_body = response.json()
-                
-                # Extract usage information
-                usage = response_body.get("usage", {})
-                input_tokens = usage.get("input_tokens", 0)
-                output_tokens = usage.get("output_tokens", 0)
-                cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
-                cache_read_tokens = usage.get("cache_read_input_tokens", 0)
-                
-                # Calculate cost
-                cost = self._calculate_cost(model, usage)
-                
-                # Log the request
-                log_entry = {
-                    "timestamp": datetime.now().isoformat(),
-                    "model": model,
-                    "cache_hit": False,
-                    "latency_ms": latency_ms,
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_creation_input_tokens": cache_creation_tokens,
-                        "cache_read_input_tokens": cache_read_tokens,
-                    },
-                    "cost_usd": cost,
-                    "saved_usd": 0.0,
-                }
-                self._log_request(log_entry)
-                
-                # Cache the response if it doesn't contain tool use
-                if not self._has_tool_use(response_body):
-                    self._save_to_cache(request_hash, request_body, response_body)
-                
-                return web.Response(
-                    status=response.status_code,
-                    body=response.content,
-                    headers={"content-type": "application/json"},
-                )
-                
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+                if stream:
+                    return await self._forward_stream(request, client, url, headers,
+                                                      request_body, request_hash, model, start)
+                response = await client.post(url, json=request_body, headers=headers)
         except httpx.HTTPError as e:
-            return web.Response(status=500, text=f"Proxy error: {str(e)}")
+            return web.Response(status=502, text=f"Proxy error: {e}")
+
+        try:
+            response_body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            response_body = None
+
+        if response.status_code == 200 and isinstance(response_body, dict):
+            self._log(model, False, start, response_body.get("usage", {}), stream=False)
+            if not self._has_tool_use(response_body):
+                self._save_to_cache(request_hash, request_body, response_body=response_body)
+
+        return web.Response(
+            status=response.status_code,
+            body=response.content,
+            headers={"content-type": response.headers.get("content-type", "application/json"),
+                     "x-claude-proxy-cache": "miss"},
+        )
+
+    async def _forward_stream(self, request, client, url, headers, request_body,
+                              request_hash, model, start) -> web.StreamResponse:
+        async with client.stream("POST", url, json=request_body, headers=headers) as upstream:
+            resp = web.StreamResponse(
+                status=upstream.status_code,
+                headers={"content-type": upstream.headers.get("content-type", "text/event-stream"),
+                         "x-claude-proxy-cache": "miss"},
+            )
+            await resp.prepare(request)
+            chunks = []
+            try:
+                async for chunk in upstream.aiter_raw():
+                    chunks.append(chunk)
+                    await resp.write(chunk)
+            except httpx.HTTPError:
+                # Upstream dropped mid-stream: end the response, don't log or cache.
+                await resp.write_eof()
+                return resp
+            await resp.write_eof()
+
+        if upstream.status_code == 200:
+            raw = b"".join(chunks)
+            usage, has_tool_use = parse_sse_usage(raw)
+            self._log(model, False, start, usage, stream=True)
+            if not has_tool_use and b"message_stop" in raw:
+                self._save_to_cache(request_hash, request_body,
+                                    sse=raw.decode("utf-8", errors="replace"), usage=usage)
+        return resp
+
+    async def passthrough(self, request: web.Request) -> web.Response:
+        """Forward other POST endpoints (e.g. count_tokens) without logging or caching."""
+        body = await request.read()
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(self._upstream_url(request), content=body,
+                                      headers=self._upstream_headers(request))
+        except httpx.HTTPError as e:
+            return web.Response(status=502, text=f"Proxy error: {e}")
+        return web.Response(status=r.status_code, body=r.content,
+                            headers={"content-type": r.headers.get("content-type",
+                                                                   "application/json")})
 
     async def health_check(self, request: web.Request) -> web.Response:
-        """Health check endpoint."""
-        return web.json_response({"status": "ok", "proxy": "throttle"})
+        return web.json_response({"status": "ok", "proxy": "claude-cost-proxy",
+                                  "upstream": self.upstream})
 
     def create_app(self) -> web.Application:
-        """Create the aiohttp application."""
-        app = web.Application()
+        app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_post("/v1/messages", self.handle_request)
+        app.router.add_post("/v1/messages/count_tokens", self.passthrough)
         app.router.add_get("/health", self.health_check)
         return app
 
     def run(self) -> None:
-        """Run the proxy server."""
         app = self.create_app()
-        print(f"🚀 Throttle proxy starting on http://localhost:{self.port}")
+        print(f"🚀 Claude cost proxy starting on http://{self.host}:{self.port}")
         print(f"📁 Logs: {self.log_dir}")
         print(f"💾 Cache: {self.cache_dir}")
-        print(f"🔑 API key: {'configured' if self.api_key else 'NOT CONFIGURED'}")
-        print(f"\nForwarding requests to https://api.anthropic.com")
-        print(f"Press Ctrl+C to stop\n")
-        
-        web.run_app(app, host="127.0.0.1", port=self.port, print=None)
+        print(f"🔑 API key: {'configured' if self.api_key else 'not set (client key is forwarded)'}")
+        print(f"\nForwarding requests to {self.upstream}")
+        print("Press Ctrl+C to stop\n")
+        web.run_app(app, host=self.host, port=self.port, print=None)
+
+
+# Friendlier alias; ThrottleProxy is kept for existing imports.
+CostProxy = ThrottleProxy
 
 
 def main() -> None:
-    """Entry point for the proxy server."""
     import sys
-    
+
     port = int(os.getenv("THROTTLE_PORT", "8080"))
     if len(sys.argv) > 1:
+        if sys.argv[1] in ("-h", "--help"):
+            print("Usage: claude-proxy [PORT]")
+            print()
+            print("Env: ANTHROPIC_API_KEY, CLAUDE_PROXY_HOME, CLAUDE_PROXY_UPSTREAM, THROTTLE_PORT")
+            sys.exit(0)
         try:
             port = int(sys.argv[1])
         except ValueError:
             print(f"Invalid port: {sys.argv[1]}", file=sys.stderr)
             sys.exit(1)
-    
+
     proxy = ThrottleProxy(port=port)
-    
     if not proxy.api_key:
-        print("ERROR: ANTHROPIC_API_KEY not found in environment", file=sys.stderr)
-        print("Run 'throttle-setup' first to configure your API key", file=sys.stderr)
+        print("ERROR: no Anthropic API key found (env ANTHROPIC_API_KEY or "
+              f"{config.config_file()})", file=sys.stderr)
+        print("Run 'claude-proxy-setup' first, or try 'claude-proxy-demo' (no key needed).",
+              file=sys.stderr)
         sys.exit(1)
-    
+
     try:
         proxy.run()
     except KeyboardInterrupt:
-        print("\n\n👋 Throttle proxy stopped")
+        print("\n\n👋 Proxy stopped")
 
 
 if __name__ == "__main__":

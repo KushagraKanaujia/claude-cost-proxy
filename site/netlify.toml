@@ -1,0 +1,5 @@
+# Static demo page. Deployed manually: netlify deploy --prod --dir=site
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"

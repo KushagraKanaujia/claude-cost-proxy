@@ -1,10 +1,12 @@
-"""Setup command to configure Claude Code to use Throttle proxy."""
+"""Setup command to configure Claude Code to use claude-cost-proxy."""
 import json
 import os
 import sys
 from getpass import getpass
 from pathlib import Path
 from typing import Optional
+
+from . import config
 
 
 def get_claude_settings_path() -> Path:
@@ -38,24 +40,22 @@ def write_settings(settings: dict) -> None:
 
 
 def save_api_key(api_key: str) -> None:
-    """Save API key to Throttle config."""
-    config_dir = Path.home() / ".throttle"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    
-    config_file = config_dir / "config.json"
-    config = {}
+    """Save API key to the proxy config (mode 0600)."""
+    config_file = config.config_file()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
     
     if config_file.exists():
         try:
             with open(config_file, "r") as f:
-                config = json.load(f)
+                data = json.load(f)
         except json.JSONDecodeError:
-            config = {}
+            data = {}
     
-    config["api_key"] = api_key
+    data["api_key"] = api_key
     
     with open(config_file, "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(data, f, indent=2)
     
     # Set restrictive permissions
     config_file.chmod(0o600)
@@ -63,8 +63,8 @@ def save_api_key(api_key: str) -> None:
 
 
 def load_api_key() -> Optional[str]:
-    """Load API key from Throttle config."""
-    config_file = Path.home() / ".throttle" / "config.json"
+    """Load API key from the saved config."""
+    config_file = config.config_file()
     
     if not config_file.exists():
         return None
@@ -79,10 +79,10 @@ def load_api_key() -> Optional[str]:
 
 def setup(port: int = 8080) -> None:
     """Run the setup wizard."""
-    print("🔧 Throttle Setup")
+    print("🔧 Claude Cost Proxy Setup")
     print("=" * 50)
     print()
-    print("This will configure Claude Code to use Throttle as a")
+    print("This will configure Claude Code to use claude-cost-proxy as a")
     print("cost-tracking and caching layer for the Anthropic API.")
     print()
     
@@ -135,11 +135,11 @@ def setup(port: int = 8080) -> None:
     print("✅ Setup complete!")
     print()
     print("Next steps:")
-    print(f"  1. Start the proxy: throttle-proxy {port}")
+    print(f"  1. Start the proxy: claude-proxy {port}")
     print("  2. Restart Claude Code")
     print("  3. Use Claude Code normally - all requests will be logged and cached")
     print()
-    print(f"View stats anytime with: throttle-summary")
+    print("View stats anytime with: claude-proxy-summary")
     print()
 
 
@@ -149,9 +149,9 @@ def main() -> None:
     
     if len(sys.argv) > 1:
         if sys.argv[1] in ("-h", "--help"):
-            print("Usage: throttle-setup [PORT]")
+            print("Usage: claude-proxy-setup [PORT]")
             print()
-            print("Configure Claude Code to use Throttle proxy.")
+            print("Configure Claude Code to use claude-cost-proxy.")
             print(f"Default port: {port}")
             sys.exit(0)
         try:
